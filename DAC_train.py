@@ -124,6 +124,27 @@ class Buffer(SerializedBuffer):
     def addAbsorbing(self):
         self.append(self.absorbing_state, self.zero_action, 0, False, self.absorbing_state)
 
+    def save_contents(self):
+        return {
+            'state': self.states[:self._n].cpu(),
+            'action': self.actions[:self._n].cpu(),
+            'reward': self.rewards[:self._n].cpu(),
+            'done': self.dones[:self._n].cpu(),
+            'next_state': self.next_states[:self._n].cpu(),
+            '_n': self._n,
+            '_p': self._p
+        }
+
+    def load_contents(self, data):
+        length = data['_n']
+        self._n = length
+        self._p = data['_p']
+        self.states[:length] = data['state'].to(self.device)
+        self.actions[:length] = data['action'].to(self.device)
+        self.rewards[:length] = data['reward'].to(self.device)
+        self.dones[:length] = data['done'].to(self.device)
+        self.next_states[:length] = data['next_state'].to(self.device)
+
 
 class Discriminator(nn.Module):
     def __init__(self, num_inputs, hidden_size=100, lamb=10, entropy_weight=0.001):
@@ -152,7 +173,7 @@ class Discriminator(nn.Module):
         return torch.log(probs + 1e-8) - torch.log(1 - probs + 1e-8)
 
     def adjust_adversary_learning_rate(self, lr):
-        print("Setting adversary learning rate to: {}".format(lr))
+        # print("Setting adversary learning rate to: {}".format(lr))
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
 
@@ -242,6 +263,7 @@ class TD3:
             state = x
             action = y
             next_state = u
+            # Compute reward using discriminator
             reward = discriminator.reward(torch.cat([state, action], dim=1).to(device))
 
             # Clipped next action with noise
@@ -324,18 +346,72 @@ def evaluate_policy(env, policy, time_step, evaluation_trajectories=6):
     return rewards
 
 
+def save_checkpoint(checkpoint_path, td3_policy, discriminator, replay_buffer, actor_losses, critic_losses, evaluations, steps_since_eval, lr_tracker):
+    checkpoint = {
+        'actor_state_dict': td3_policy.actor.state_dict(),
+        'critic_state_dict': td3_policy.critic.state_dict(),
+        'discriminator_state_dict': discriminator.state_dict(),
+        'replay_buffer': replay_buffer.save_contents(),
+        'actor_losses': actor_losses,
+        'critic_losses': critic_losses,
+        'evaluations': evaluations,
+        'steps_since_eval': steps_since_eval,
+        'lr': lr_tracker.lr,
+        'decay_factor': lr_tracker.decay_factor,
+        'training_step': lr_tracker.training_step
+    }
+
+    directory = os.path.dirname(checkpoint_path)
+    if directory and directory.strip():
+        os.makedirs(directory, exist_ok=True)
+    # If directory is empty, it means checkpoint_path has no directory component and is just a filename in current dir
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
+
+
+def load_checkpoint(checkpoint_path, td3_policy, discriminator, replay_buffer):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    td3_policy.actor.load_state_dict(checkpoint['actor_state_dict'])
+    td3_policy.critic.load_state_dict(checkpoint['critic_state_dict'])
+    discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+    replay_buffer.load_contents(checkpoint['replay_buffer'])
+
+    actor_losses = checkpoint['actor_losses']
+    critic_losses = checkpoint['critic_losses']
+    evaluations = checkpoint['evaluations']
+    steps_since_eval = checkpoint['steps_since_eval']
+
+    lr_tracker = LearningRate.get_instance()
+    lr_tracker.lr = checkpoint['lr']
+    lr_tracker.decay_factor = checkpoint['decay_factor']
+    lr_tracker.training_step = checkpoint['training_step']
+
+    print(f"Loaded checkpoint from {checkpoint_path}")
+    return actor_losses, critic_losses, evaluations, steps_since_eval
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train DAC agent.")
     parser.add_argument("--num_steps", type=int, default=200000, help="Total training steps")
     parser.add_argument("--results_dir", type=str, default="results", help="Directory to save results")
     parser.add_argument("--model_dir", type=str, default="models", help="Directory to save models")
     parser.add_argument("--expert_buffer_path", type=str, required=True, help="Path to expert buffer")
+    parser.add_argument("--checkpoint_path", type=str, default="checkpoint", help="Path to save/load checkpoints")
+    parser.add_argument("--checkpoint_interval", type=int, default=50000, help="Interval to save checkpoints")
+    parser.add_argument("--resume_path", type=str, default=None, help="Path to resume training from a checkpoint")
+
     args = parser.parse_args()
+    
+    print(f"checkpoint_path: {args.checkpoint_path}")
 
     num_steps = args.num_steps
     results_dir = args.results_dir
     model_dir = args.model_dir
     expert_buffer_path = args.expert_buffer_path
+    checkpoint_path = args.checkpoint_path
+    checkpoint_interval = args.checkpoint_interval
+    resume_path = args.resume_path
 
     env = gym.make("BipedalWalker-v3")
     state_dim = env.observation_space.shape[0]
@@ -350,7 +426,6 @@ if __name__ == "__main__":
     lr.set_decay(0.5)
 
     expert_buffer = SerializedBuffer(expert_buffer_path, device)
-    expert_buffer_size = expert_buffer.buffer_size
 
     replay_buffer = Buffer(num_steps, env.observation_space.shape, env.action_space.shape, device)
     policy = TD3(state_dim, action_dim, max_action, actor_clipping=40, decay_steps=100000)
@@ -363,9 +438,14 @@ if __name__ == "__main__":
     actor_losses = []
     critic_losses = []
 
+    # Resume if required
+    if resume_path is not None and resume_path.strip():
+        a_losses, c_losses, evaluations, steps_since_eval = load_checkpoint(resume_path, policy, discriminator, replay_buffer)
+        actor_losses = a_losses
+        critic_losses = c_losses
+
     while len(replay_buffer) < num_steps:
-        # print status and current avg reward
-        print(f"Current buffer size: {len(replay_buffer)}, reward: {np.mean(evaluations[-1])}")   
+        print(f"Current buffer size: {len(replay_buffer)}, Last evaluation mean reward: {np.mean(evaluations[-1][:-1]) if len(evaluations[-1])>1 else 0}")   
         
         current_state = env.reset()
         for _ in range(trajectory_length):
@@ -378,18 +458,87 @@ if __name__ == "__main__":
             else:
                 current_state = next_state
 
-        actor_loss, critic_loss = policy.train(discriminator, replay_buffer, trajectory_length, batch_size, writer=writer)
-        actor_losses.extend(actor_loss)
-        critic_losses.extend(critic_loss)
+        # Adjust discriminator learning rate
+        lr_tracker = LearningRate.get_instance()
+        discriminator.adjust_adversary_learning_rate(lr_tracker.lr)
+
+        # Train the discriminator for 'trajectory_length' iterations as a placeholder
+        for _ in range(trajectory_length):
+            x, y, r, d, u = replay_buffer.sample(batch_size)
+            state = x
+            action = y
+
+            # sample expert data
+            idxes = np.random.randint(low=0, high=expert_buffer._n, size=batch_size)
+            expert_obs = expert_buffer.states[idxes]
+            expert_act = expert_buffer.actions[idxes]
+            # Assign equal weights
+            expert_weights = torch.ones((batch_size,1), device=device, dtype=torch.float32)
+
+            state_action = torch.cat([state, action], 1).to(device)
+            expert_state_action = torch.cat([expert_obs, expert_act], 1).to(device)
+
+            min_batch_size = min(state_action.size(0), expert_state_action.size(0))
+            state_action = state_action[:min_batch_size]
+            expert_state_action = expert_state_action[:min_batch_size]
+            expert_weights = expert_weights[:min_batch_size]
+
+            fake = discriminator(state_action)
+            real = discriminator(expert_state_action)
+
+            # gradient penalty
+            batch_size_ = min_batch_size
+            alpha = torch.rand(batch_size_, 1, device=device)
+
+            interpolated = alpha * expert_state_action[:batch_size_] + (1 - alpha) * state_action[:batch_size_]
+            interpolated.requires_grad_(True)
+
+            prob_interpolated = discriminator(interpolated)
+            gradients = torch.autograd.grad(
+                outputs=prob_interpolated, 
+                inputs=interpolated,
+                grad_outputs=torch.ones_like(prob_interpolated),
+                create_graph=True, 
+                retain_graph=True
+            )[0]
+
+            gradients = gradients.view(batch_size_, -1)
+            gradients_norm = gradients.norm(2, dim=1)
+            gradient_penalty = ((gradients_norm - 1) ** 2).mean() * discriminator.LAMBDA
+
+            # CE loss
+            learner_loss = torch.log(1 - torch.sigmoid(fake))
+            expert_loss = torch.log(torch.sigmoid(real)) * expert_weights
+            main_loss = -torch.sum(learner_loss + expert_loss)
+
+            total_loss = main_loss + gradient_penalty
+            discriminator.optimizer.zero_grad()
+            total_loss.backward()
+            discriminator.optimizer.step()
+
+        # Train the TD3 policy
+        td3_actor_losses, td3_critic_losses = policy.train(discriminator, replay_buffer, trajectory_length, batch_size, writer=writer)
+        actor_losses.extend(td3_actor_losses)
+        critic_losses.extend(td3_critic_losses)
 
         steps_since_eval += trajectory_length
         if steps_since_eval >= 8000:
             evaluations.append(evaluate_policy(env, policy, len(replay_buffer)))
             steps_since_eval = 0
 
+        if checkpoint_path and checkpoint_path.strip():
+            if len(replay_buffer) % checkpoint_interval == 0:
+                save_checkpoint(checkpoint_path, policy, discriminator, replay_buffer, actor_losses, critic_losses, evaluations, steps_since_eval, LearningRate.get_instance())
+                print(f"Checkpoint saved at {len(replay_buffer)} steps")
+
     evaluations.append(evaluate_policy(env, policy, len(replay_buffer)))
     store_results(evaluations, len(replay_buffer), actor_losses, critic_losses, results_dir)
 
-    model_name = f"DAC_policy_{expert_buffer_size}_buffer_{num_steps}_steps_{int(time.time())}"
+    model_name = f"DAC_policy_{num_steps}_steps_{int(time.time())}"
     policy.save(model_name, model_dir)
     print(f"Model saved as {model_name} in {model_dir}")
+
+    # Final checkpoint
+    if checkpoint_path and checkpoint_path.strip():
+        save_checkpoint(checkpoint_path, policy, discriminator, replay_buffer, actor_losses, critic_losses, evaluations, steps_since_eval, LearningRate.get_instance())
+        print(f"Final checkpoint saved at {len(replay_buffer)} steps")

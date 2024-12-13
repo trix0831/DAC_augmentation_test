@@ -7,12 +7,12 @@ import numpy as np
 import pandas as pd
 import torch
 import time
-import torch.nn as nn
+import os
 from torch import Tensor
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_value_
 from torch.autograd import grad as torch_grad
-import os
 from torch.utils.tensorboard import SummaryWriter
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,6 +58,7 @@ class LearningRate:
             raise ValueError("Learning rate has not been set.")
         self.lr = self.lr * self.decay_factor
 
+
 class SerializedBuffer:
     def __init__(self, path=None, device=None):
         if path is not None:
@@ -80,6 +81,7 @@ class SerializedBuffer:
             self.dones[idxes],
             self.next_states[idxes]
         )
+
 
 class Buffer(SerializedBuffer):
     def __init__(self, buffer_size, state_shape, action_shape, device):
@@ -122,16 +124,6 @@ class Buffer(SerializedBuffer):
     def addAbsorbing(self):
         self.append(self.absorbing_state, self.zero_action, 0, False, self.absorbing_state)
 
-    def save(self, path):
-        if not os.path.exists(os.path.dirname(path)):
-            os.makedirs(os.path.dirname(path))
-        torch.save({
-            'state': self.states.clone().cpu(),
-            'action': self.actions.clone().cpu(),
-            'reward': self.rewards.clone().cpu(),
-            'done': self.dones.clone().cpu(),
-            'next_state': self.next_states.clone().cpu(),
-        }, path)
 
 class Discriminator(nn.Module):
     def __init__(self, num_inputs, hidden_size=100, lamb=10, entropy_weight=0.001):
@@ -148,8 +140,6 @@ class Discriminator(nn.Module):
         self.LAMBDA = lamb
         self.use_cuda = torch.cuda.is_available()
 
-        self.loss = self.ce_loss
-
     def forward(self, x):
         x = torch.tanh(self.linear1(x))
         x = torch.tanh(self.linear2(x))
@@ -165,71 +155,6 @@ class Discriminator(nn.Module):
         print("Setting adversary learning rate to: {}".format(lr))
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
-    def ce_loss(self, pred_on_learner, pred_on_expert, expert_weights):
-        learner_loss = torch.log(1 - torch.sigmoid(pred_on_learner))
-        expert_loss = torch.log(torch.sigmoid(pred_on_expert)) * expert_weights
-        return -torch.sum(learner_loss + expert_loss)
-
-    def learn(self, replay_buf, expert_buf, iterations, batch_size=100):
-        self.adjust_adversary_learning_rate(LearningRate.get_instance().lr)
-        total_losses = []
-
-        for it in range(iterations):
-            x, y, r, d, u = replay_buf.sample(batch_size)
-            state = x
-            action = y
-
-            expert_obs, expert_act, expert_weights = expert_buf.get_next_batch(batch_size)
-            expert_obs = torch.tensor(expert_obs, dtype=torch.float32, device=device)
-            expert_act = torch.tensor(expert_act, dtype=torch.float32, device=device)
-            expert_weights = torch.tensor(expert_weights, dtype=torch.float32, device=device).view(-1, 1)
-
-            state_action = torch.cat([state, action], 1).to(device)
-            expert_state_action = torch.cat([expert_obs, expert_act], 1).to(device)
-
-            min_batch_size = min(state_action.size(0), expert_state_action.size(0))
-            state_action = state_action[:min_batch_size]
-            expert_state_action = expert_state_action[:min_batch_size]
-            expert_weights = expert_weights[:min_batch_size]
-
-            fake = self(state_action)
-            real = self(expert_state_action)
-
-            gradient_penalty = self._gradient_penalty(expert_state_action, state_action)
-            main_loss = self.loss(fake, real, expert_weights)
-
-            self.optimizer.zero_grad()
-            total_loss = main_loss + gradient_penalty
-            total_losses.append(total_loss.item())
-
-            if it == 0 or it == iterations - 1:
-                print("Discr Iteration:  {:03} ---- Loss: {:.5f} | Learner Prob: {:.5f} | Expert Prob: {:.5f}".format(
-                    it, total_loss.item(), torch.sigmoid(fake[0]).item(), torch.sigmoid(real[0]).item()
-                ))
-            total_loss.backward()
-            self.optimizer.step()
-
-        return total_losses
-
-    def _gradient_penalty(self, real_data, generated_data):
-        batch_size = min(real_data.size(0), generated_data.size(0))
-        device = real_data.device
-
-        alpha = torch.rand(batch_size, 1, device=device)
-        interpolated = alpha * real_data[:batch_size] + (1 - alpha) * generated_data[:batch_size]
-        interpolated.requires_grad_(True)
-
-        prob_interpolated = self(interpolated)
-
-        gradients = torch_grad(outputs=prob_interpolated, inputs=interpolated,
-                        grad_outputs=torch.ones_like(prob_interpolated),
-                        create_graph=True, retain_graph=True)[0]
-
-        gradients = gradients.view(batch_size, -1)
-        gradients_norm = gradients.norm(2, dim=1)
-        gradient_penalty = ((gradients_norm - 1) ** 2).mean()
-
-        return self.LAMBDA * gradient_penalty
 
 class Actor(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, max_action: float):
@@ -242,16 +167,12 @@ class Actor(nn.Module):
         self.max_action = max_action
 
     def forward(self, x: Tensor) -> Tensor:
-        device = x.device
         x = x.to(device).float()
         x = torch.relu(self.l1(x))
         x = torch.relu(self.l2(x))
         x = torch.tanh(self.l3(x)) * self.max_action
         return x
 
-    def act(self, x: Tensor) -> Tensor:
-        x = torch.tensor(x, dtype=torch.float32, device=device)
-        return self(x)
 
 class Critic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
@@ -285,7 +206,7 @@ class Critic(nn.Module):
         x1 = self.l3(x1)
         return x1
 
-class TD3(object):
+class TD3:
     def __init__(self, state_dim, action_dim, max_action, actor_clipping, decay_steps):
         self.actor = Actor(state_dim, action_dim, max_action).to(device)
         self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
@@ -304,18 +225,6 @@ class TD3(object):
         state = torch.tensor(state.reshape(1, -1), dtype=torch.float32).to(device)
         return self.actor(state).cpu().data.numpy().flatten()
 
-    def adjust_critic_learning_rate(self, lr):
-        print("Setting critic learning rate to: {}".format(lr))
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
-
-    def adjust_actor_learning_rate(self, lr):
-        print("Setting actor learning rate to: {}".format(lr))
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
-
-    def reward(self, discriminator, states, actions):
-        states_actions = torch.cat([states, actions], 1).to(device)
-        return discriminator.reward(states_actions)
-
     def train(self, discriminator, replay_buf, iterations, batch_size=100, discount=0.8, tau=0.005, policy_noise=0.2,
               noise_clip=0.5, policy_freq=2, writer=None):
 
@@ -333,90 +242,72 @@ class TD3(object):
             state = x
             action = y
             next_state = u
-            reward = self.reward(discriminator, state, action)
+            reward = discriminator.reward(torch.cat([state, action], dim=1).to(device))
 
-            min_batch_size = min(state.size(0), action.size(0), next_state.size(0))
-            state = state[:min_batch_size]
-            action = action[:min_batch_size]
-            next_state = next_state[:min_batch_size]
-            reward = reward[:min_batch_size]
-
-            noise = torch.randn_like(action) * policy_noise
-            noise = noise.clamp(-noise_clip, noise_clip)
-
-            next_action = self.actor_target(next_state) + noise
-            next_action = next_action.clamp(-self.max_action, self.max_action)
+            # Clipped next action with noise
+            next_action = self.actor_target(next_state) + \
+                torch.clamp(torch.randn_like(action) * policy_noise, -noise_clip, noise_clip)
+            next_action = torch.clamp(next_action, -self.max_action, self.max_action)
 
             target_Q1, target_Q2 = self.critic_target(next_state, next_action)
-            target_Q = torch.min(target_Q1, target_Q2)
-            target_Q = reward + (discount * target_Q).detach()
+            target_Q = reward + discount * torch.min(target_Q1, target_Q2).detach()
 
             current_Q1, current_Q2 = self.critic(state, action)
             critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
-            if iteration == 0 or iteration == iterations - 1:
-                print("Critic Iteration: {:3} ---- Loss: {:.5f}".format(iteration, critic_loss.item()))
             critic_losses.append(critic_loss.item())
-
-            if writer is not None:
-                writer.add_scalar('Loss/Critic', critic_loss.item(), lr_tracker.training_step)
 
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             self.critic_optimizer.step()
 
+            # Policy update
             if iteration % policy_freq == 0:
                 actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
-                if iteration == 0 or iteration == iterations - 1 or iteration == iterations - 2:
-                    print("Actor Iteration:  {:3} ---- Loss: {:.5f}".format(iteration, actor_loss.item()))
                 actor_losses.append(actor_loss.item())
-                if writer is not None:
-                    writer.add_scalar('Loss/Actor', actor_loss.item(), lr_tracker.training_step)
 
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 clip_grad_value_(self.actor.parameters(), self.actor_grad_clipping)
                 self.actor_optimizer.step()
-                lr_tracker.training_step += 1
-                step = lr_tracker.training_step
 
-                if step != 0 and step % self.decay_steps == 0:
-                    print("Decaying learning rate at step: {}".format(step))
-                    lr_tracker.decay()
-
-                    self.adjust_actor_learning_rate(lr_tracker.lr)
-                    self.adjust_critic_learning_rate(lr_tracker.lr)
+                # Update the target networks
+                for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                    target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
                 for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                     target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-                for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                    target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
         return actor_losses, critic_losses
 
+    def adjust_actor_learning_rate(self, lr):
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
+
+    def adjust_critic_learning_rate(self, lr):
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
+
     def save(self, filename, directory):
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        torch.save(self.actor.state_dict(), '%s/%s_actor.pth' % (directory, filename))
-        torch.save(self.critic.state_dict(), '%s/%s_critic.pth' % (directory, filename))
+        os.makedirs(directory, exist_ok=True)
+        torch.save(self.actor.state_dict(), os.path.join(directory, f"{filename}_actor.pth"))
+        torch.save(self.critic.state_dict(), os.path.join(directory, f"{filename}_critic.pth"))
 
     def load(self, filename, directory):
-        self.actor.load_state_dict(torch.load('%s/%s_actor.pth' % (directory, filename), map_location=device))
-        self.critic.load_state_dict(torch.load('%s/%s_critic.pth' % (directory, filename), map_location=device))
+        self.actor.load_state_dict(torch.load(os.path.join(directory, f"{filename}_actor.pth"), map_location=device))
+        self.critic.load_state_dict(torch.load(os.path.join(directory, f"{filename}_critic.pth"), map_location=device))
 
-def store_results(evaluations, number_of_timesteps, actor_losses, critic_losses):
+
+def store_results(evaluations, number_of_timesteps, actor_losses, critic_losses, results_dir):
+    os.makedirs(results_dir, exist_ok=True)
     df = pd.DataFrame.from_records(evaluations)
-    number_of_trajectories = len(evaluations[0]) - 1
-    columns = ["reward_trajectory_{}".format(i + 1) for i in range(number_of_trajectories)]
-    columns.append("timestep")
+    columns = [f"reward_trajectory_{i+1}" for i in range(len(evaluations[0]) - 1)] + ["timestep"]
     df.columns = columns
+    df["actor_loss"] = pd.Series(actor_losses)
+    df["critic_loss"] = pd.Series(critic_losses)
 
-    df['actor_loss'] = pd.Series(actor_losses)
-    df['critic_loss'] = pd.Series(critic_losses)
+    timestamp = int(time.time())
+    results_file = os.path.join(results_dir, f"DAC_results_{number_of_timesteps}_steps_{timestamp}.csv")
+    df.to_csv(results_file, index=False)
+    print(f"Results saved to {results_file}")
 
-    timestamp = time.time()
-    results_fname = 'DAC_{}_tsteps_{}_results.csv'.format(number_of_timesteps, timestamp)
-    df.to_csv(str(results_fname), index=False)
 
 def evaluate_policy(env, policy, time_step, evaluation_trajectories=6):
     rewards = []
@@ -425,122 +316,28 @@ def evaluate_policy(env, policy, time_step, evaluation_trajectories=6):
         obs = env.reset()
         done = False
         while not done:
-            if not isinstance(obs, np.ndarray):
-                obs = np.array(obs, dtype=np.float32)
-            action = policy.select_action(np.array(obs, dtype=np.float32))
-            obs, reward, done, info = env.step(action)
+            action = policy.select_action(obs)
+            obs, reward, done, _ = env.step(action)
             r += reward
         rewards.append(r)
-    print("Average reward at timestep {}: {}".format(time_step, np.mean(rewards)))
-
     rewards.append(time_step)
     return rewards
 
-def load_dataset(path, limit_trajs=None, data_subsamp_freq=1):
-    tmp = torch.load(path, map_location=device)
-    full_dset_size = tmp['state'].size(0)
-    state_dim = tmp['state'].size(1)
-    action_dim = tmp['action'].size(1)
-
-    steps_per_traj = 500
-    num_trajs = full_dset_size // steps_per_traj
-    dset_size = num_trajs * steps_per_traj
-
-    states = tmp['state'][:dset_size].reshape(num_trajs, steps_per_traj, state_dim).clone()
-    actions = tmp['action'][:dset_size].reshape(num_trajs, steps_per_traj, action_dim).clone()
-    rewards = tmp['reward'][:dset_size].reshape(num_trajs, steps_per_traj, 1).clone()
-    return states, actions, rewards
-
-class Dset(object):
-    def __init__(self, obs, acs, num_traj, absorbing_state, absorbing_action):
-        self.obs = obs
-        self.acs = acs
-        self.num_traj = num_traj
-        assert len(self.obs) == len(self.acs)
-        assert self.num_traj > 0
-        self.steps_per_traj = int(len(self.obs) / num_traj)
-
-        self.absorbing_state = absorbing_state
-        self.absorbing_action = absorbing_action
-
-    def get_next_batch(self, batch_size):
-        assert batch_size <= len(self.obs)
-        num_samples_per_traj = max(1, batch_size // self.num_traj)
-
-        if num_samples_per_traj * self.num_traj != batch_size:
-            batch_size = num_samples_per_traj * self.num_traj
-
-        N = self.steps_per_traj / num_samples_per_traj
-        j = num_samples_per_traj
-        num_samples_per_traj = num_samples_per_traj - 1
-
-        obs = None
-        acs = None
-        weights = [1 for i in range(batch_size)]
-        while j <= batch_size:
-            weights[j - 1] = 1.0 / N
-            j = j + num_samples_per_traj + 1
-
-        for i in range(self.num_traj):
-            indicies = np.sort(
-                np.random.choice(range(self.steps_per_traj * i, self.steps_per_traj * (i + 1)), num_samples_per_traj,
-                                 replace=False))
-            if obs is None:
-                obs = np.concatenate((self.obs[indicies, :], self.absorbing_state), axis=0)
-            else:
-                obs = np.concatenate((obs, self.obs[indicies, :], self.absorbing_state), axis=0)
-
-            if acs is None:
-                acs = np.concatenate((self.acs[indicies, :], self.absorbing_action), axis=0)
-            else:
-                acs = np.concatenate((acs, self.acs[indicies, :], self.absorbing_action), axis=0)
-
-        return obs, acs, weights
-
-class Mujoco_Dset(object):
-    def __init__(self, env, expert_path, traj_limitation=-1):
-        obs, acs, rets = load_dataset(expert_path, traj_limitation)
-        obs = obs.cpu().numpy()
-        acs = acs.cpu().numpy()
-        rets = rets.cpu().numpy()
-
-        self.obs = np.reshape(obs, [-1, np.prod(obs.shape[2:])])
-        self.acs = np.reshape(acs, [-1, np.prod(acs.shape[2:])])
-
-        self.rets = rets.sum(axis=1)
-
-        
-        try:
-            self.avg_ret = sum(self.rets) / len(self.rets)
-        except:
-            self.avg_ret = 0
-        self.std_ret = np.std(np.array(self.rets))
-        assert len(self.obs) == len(self.acs)
-        self.num_traj = len(rets)
-        self.num_transition = len(self.obs)
-
-        absorbing_state = np.zeros((1,env.observation_space.shape[0]), dtype=np.float32)
-        zero_action = np.zeros((1, env.action_space.shape[0]), dtype=np.float32)
-        self.dset = Dset(self.obs, self.acs, self.num_traj, absorbing_state, zero_action)
-        self.log_info()
-
-    def log_info(self):
-        print("Total trajs: %d" % self.num_traj)
-        print("Total transitions: %d" % self.num_transition)
-        print("Average returns: %f" % self.avg_ret)
-        print("Std for returns: %f" % self.std_ret)
-
-    def get_next_batch(self, batch_size):
-        return self.dset.get_next_batch(batch_size)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train DAC agent.')
-    parser.add_argument('--num_steps', type=int, default=200000, help='Total training steps')
+    parser = argparse.ArgumentParser(description="Train DAC agent.")
+    parser.add_argument("--num_steps", type=int, default=200000, help="Total training steps")
+    parser.add_argument("--results_dir", type=str, default="results", help="Directory to save results")
+    parser.add_argument("--model_dir", type=str, default="models", help="Directory to save models")
+    parser.add_argument("--expert_buffer_path", type=str, required=True, help="Path to expert buffer")
     args = parser.parse_args()
 
     num_steps = args.num_steps
+    results_dir = args.results_dir
+    model_dir = args.model_dir
+    expert_buffer_path = args.expert_buffer_path
 
-    env = gym.make('BipedalWalker-v3')
+    env = gym.make("BipedalWalker-v3")
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -549,67 +346,50 @@ if __name__ == "__main__":
     batch_size = 2500
 
     lr = LearningRate.get_instance()
-    lr.lr = 10 ** (-3)
-    lr.decay_factor = 0.5
+    lr.set_learning_rate(1e-3)
+    lr.set_decay(0.5)
 
-    expert_buffer = Mujoco_Dset(env, 'expert_buffer/size50000_std0.01_prand0.0.pth', 50000)
-    state_shape = env.observation_space.shape
-    action_shape = env.action_space.shape
+    expert_buffer = SerializedBuffer(expert_buffer_path, device)
+    expert_buffer_size = expert_buffer.buffer_size
 
-    actor_replay_buffer = Buffer(buffer_size=num_steps, state_shape=state_shape, action_shape=action_shape, device=device)
-
-    td3_policy = TD3(state_dim, action_dim, max_action, 40, 10 ** 5)
+    replay_buffer = Buffer(num_steps, env.observation_space.shape, env.action_space.shape, device)
+    policy = TD3(state_dim, action_dim, max_action, actor_clipping=40, decay_steps=100000)
     discriminator = Discriminator(state_dim + action_dim).to(device)
 
     writer = SummaryWriter()
-    evaluations = [evaluate_policy(env, td3_policy, 0)]
-    evaluate_every = 8000
+    evaluations = [evaluate_policy(env, policy, 0)]
     steps_since_eval = 0
-
-    env.reset()
 
     actor_losses = []
     critic_losses = []
 
-    start_time = time.time()
-
-    while len(actor_replay_buffer) < num_steps:
-        print("\nCurrent step: {}".format(len(actor_replay_buffer)))
+    while len(replay_buffer) < num_steps:
+        # print status and current avg reward
+        print(f"Current buffer size: {len(replay_buffer)}, reward: {np.mean(evaluations[-1])}")   
+        
         current_state = env.reset()
-        for j in range(trajectory_length):
-            action = td3_policy.select_action(np.array(current_state))
-            obs, reward, done, info = env.step(action)
+        for _ in range(trajectory_length):
+            action = policy.select_action(current_state)
+            next_state, reward, done, _ = env.step(action)
+            replay_buffer.append(current_state, action, reward, done, next_state)
 
             if done:
-                actor_replay_buffer.addAbsorbing()
                 current_state = env.reset()
             else:
-                actor_replay_buffer.add((current_state, action, obs), reward, done)
-                current_state = obs
+                current_state = next_state
 
-        discriminator_losses = discriminator.learn(actor_replay_buffer, expert_buffer, trajectory_length, batch_size)
-        td3_actor_losses, td3_critic_losses = td3_policy.train(discriminator, actor_replay_buffer, trajectory_length, batch_size, writer=writer)
-
-        actor_losses.extend(td3_actor_losses)
-        critic_losses.extend(td3_critic_losses)
-
-        if steps_since_eval >= evaluate_every:
-            steps_since_eval = 0
-            evaluation = evaluate_policy(env, td3_policy, len(actor_replay_buffer))
-            evaluations.append(evaluation)
+        actor_loss, critic_loss = policy.train(discriminator, replay_buffer, trajectory_length, batch_size, writer=writer)
+        actor_losses.extend(actor_loss)
+        critic_losses.extend(critic_loss)
 
         steps_since_eval += trajectory_length
+        if steps_since_eval >= 8000:
+            evaluations.append(evaluate_policy(env, policy, len(replay_buffer)))
+            steps_since_eval = 0
 
-    last_evaluation = evaluate_policy(env, td3_policy, len(actor_replay_buffer))
-    evaluations.append(last_evaluation)
+    evaluations.append(evaluate_policy(env, policy, len(replay_buffer)))
+    store_results(evaluations, len(replay_buffer), actor_losses, critic_losses, results_dir)
 
-    store_results(evaluations, len(actor_replay_buffer), actor_losses, critic_losses)
-    writer.close()
-
-    # Save the trained model
-    td3_policy.save("DAC_policy", "models")
-
-    end_time = time.time()
-    total_runtime = end_time - start_time
-    print(f"Total runtime: {total_runtime:.2f} seconds")
-    writer.add_text('Runtime', f"{total_runtime:.2f} seconds")
+    model_name = f"DAC_policy_{expert_buffer_size}_buffer_{num_steps}_steps_{int(time.time())}"
+    policy.save(model_name, model_dir)
+    print(f"Model saved as {model_name} in {model_dir}")

@@ -69,11 +69,14 @@ if __name__ == "__main__":
     parser.add_argument('--episodes', type=int, default=5, help='Number of episodes to record')
     parser.add_argument('--max_steps_per_episode', type=int, default=1500, help='Max steps per episode')
     parser.add_argument('--output_video_dir', type=str, default='video', help='Output video directory')
+    parser.add_argument('--hardcore', type=bool, default=False, help='Use BipedalWalkerHardcore-v3 environment if set')
     args = parser.parse_args()
 
     os.makedirs(args.output_video_dir, exist_ok=True)
 
-    env = gym.make('BipedalWalker-v3')
+    env_name = 'BipedalWalkerHardcore-v3' if args.hardcore else 'BipedalWalker-v3'
+    env = gym.make(env_name)
+
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -96,7 +99,7 @@ if __name__ == "__main__":
 
         video_filename = os.path.join(
             args.output_video_dir, 
-            f'trained_agent_episode_{episode + 1}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.mp4'
+            f'video/trained_agent_episode_{episode + 1}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.mp4'
         )
         imageio.mimsave(video_filename, frames, fps=30)
         print(f"Episode {episode + 1} video saved to {video_filename}")

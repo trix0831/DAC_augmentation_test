@@ -1,17 +1,18 @@
 # README
 
-This repository provides three Python scripts for training a DAC (Discriminator Actor-Critic) agent, collecting demonstration data from a trained agent, and recording a video of the trained agent interacting with an environment. The environment used is typically `BipedalWalker-v3` from OpenAI Gym, but you can adapt the code to other environments that have compatible observation and action spaces.
+This repository contains several Python scripts that together demonstrate the following workflow for a DAC (Discriminator Actor-Critic) agent:
 
-## Overview
+1. **Training the DAC Agent** (`train.py`):  
+   Trains a DAC (TD3 + Discriminator) agent using expert demonstration data. Produces model weights that can be loaded by other scripts.
 
-1. **train.py**:  
-   Trains a DAC agent (TD3 + Discriminator) using expert data. After training, the model parameters (actor and critic) are saved to the specified directory.
-   
-2. **collect_demo.py**:  
-   Loads a trained DAC agent model and uses it to collect demonstration data (state, action, reward, etc.) for a desired number of steps. The collected data is stored for future use.
-   
-3. **record_video.py**:  
-   Loads a trained DAC agent model and records a video of the agent acting in the environment. The recorded frames are saved as a video file.
+2. **Collecting Demonstration Data** (`collect_demo.py`):  
+   Uses the trained DAC agent to interact with the environment and produce new demonstration data for future training or analysis.
+
+3. **Recording a Video** (`record_video.py`):  
+   Loads a trained DAC agent and records its behavior in a video file. Now supports a `--hardcore` flag to run the `BipedalWalkerHardcore-v3` environment.
+
+4. **Testing the Agent** (`testing.py`):  
+   Loads a trained DAC agent and evaluates its performance across multiple test episodes. Users can specify a list of seeds, maximum steps per episode, and number of tests. Saves test results to a CSV file. Also supports a `--hardcore` flag to test in the hardcore environment.
 
 ## Dependencies
 
@@ -20,78 +21,83 @@ This repository provides three Python scripts for training a DAC (Discriminator 
 - [NumPy](https://numpy.org/)
 - [gym](https://github.com/openai/gym)
 - [imageio](https://imageio.github.io/)
-- [tqdm](https://github.com/tqdm/tqdm)
 - [pandas](https://pandas.pydata.org/)
 - [tensorboard](https://www.tensorflow.org/tensorboard)
-
-Make sure your environment is properly set up with these libraries before running the scripts.
+- [tqdm](https://github.com/tqdm/tqdm)
 
 ## Usage
 
-### 1. Training the DAC Agent
-
-**Script:** `train.py`
-
-**Function:** Trains a DAC agent using expert demonstration data.
+### 1. Train the Agent: `train.py`
 
 **Arguments:**
+- `--num_steps`: Total number of training steps (default: `200000`)
 
-- `--num_steps`: The total number of training steps to run. Default is `200000`.
-
-**Example Command:**
+**Example:**
 ```bash
 python train.py --num_steps 5000
 ```
 
-After training, the saved model weights (`DAC_policy_actor.pth` and `DAC_policy_critic.pth`) will be placed in the `models` directory by default.
+Output: Saves model weights in `models/` directory by default.
 
-### 2. Collecting Demonstration Data
-
-**Script:** `collect_demo.py`
-
-**Function:** Uses the trained DAC model to collect demonstration data. The agent will run in the environment for a specified number of steps, and the trajectory data (states, actions, rewards, etc.) will be saved to a file for later use.
+### 2. Collect Demonstration Data: `collect_demo.py`
 
 **Arguments:**
+- `--model_dir`: Directory of saved model files (default: `models`)
+- `--model_name`: Model name prefix (default: `DAC_policy`)
+- `--buffer_size`: Steps of data to collect (default: `50000`)
+- `--std`: Action noise standard deviation (default: `0.01`)
+- `--p_rand`: Probability of random action (default: `0.0`)
+- `--output_demo_path`: Path for the collected demonstration data file
 
-- `--model_dir`: Directory where the trained model files are stored. Default: `models`.
-- `--model_name`: Prefix name of the saved model files. Default: `DAC_policy`.
-- `--buffer_size`: Number of steps of demonstration data to collect. Default: `50000`.
-- `--std`: Standard deviation of action noise added to the policy’s actions. Default: `0.01`.
-- `--p_rand`: Probability of taking a random action instead of the policy’s action. Default: `0.0`.
-- `--output_demo_path`: Path to save the collected demonstration data. Default: `demo_collection/DAC_collected_demo.pth`.
-
-**Example Command:**
+**Example:**
 ```bash
-python collect_demo.py --model_dir models --model_name DAC_policy --buffer_size 50000 --std 0.01 --p_rand 0.0 --output_demo_path demo_collection/DAC_collected_demo.pth
+python collect_demo.py --model_dir models --model_name DAC_policy --buffer_size 50000 --std 0.01 --p_rand 0.0 --output_demo_path demo_collection/my_demo.pth
 ```
 
-This will produce a `.pth` file with the collected demonstration data.
+Output: Saves a `.pth` file with collected demonstration data.
 
-### 3. Recording a Video
-
-**Script:** `record_video.py`
-
-**Function:** Renders and records the trained agent’s behavior in the environment to a video file.
+### 3. Record a Video: `record_video.py`
 
 **Arguments:**
+- `--model_dir`: Directory of saved model files (default: `models`)
+- `--model_name`: Model name prefix (default: `DAC_policy`)
+- `--episodes`: Number of episodes to record (default: `5`)
+- `--max_steps_per_episode`: Max steps per episode (default: `1500`)
+- `--output_video_path`: Output video file path (default: `trained_agent_video.mp4`)
+- `--hardcore`: Use `BipedalWalkerHardcore-v3` environment if set.
 
-- `--model_dir`: Directory where the trained model files are stored. Default: `models`.
-- `--model_name`: Prefix name of the saved model files. Default: `DAC_policy`.
-- `--episodes`: Number of episodes to record. Default: `5`.
-- `--max_steps_per_episode`: Maximum number of steps per episode to record. Default: `1500`.
-- `--output_video_path`: File path where the recorded video will be saved. Default: `trained_agent_video.mp4`.
-
-**Example Command:**
+**Example:**
 ```bash
-python record_video.py --model_dir models --model_name DAC_policy --episodes 5 --max_steps_per_episode 1500 --output_video_path trained_agent_video.mp4
+python record_video.py --model_dir models --model_name DAC_policy --episodes 2 --max_steps_per_episode 1000 --output_video_path agent_video.mp4 --hardcore
 ```
 
-This will generate a video file showing the agent’s performance.
+Output: A `agent_video.mp4` file showing the agent in the hardcore environment.
+
+### 4. Test the Agent: `testing.py`
+
+**Arguments:**
+- `--model_dir`: Directory of saved model files (default: `models`)
+- `--model_name`: Model name prefix (default: `DAC_policy`)
+- `--num_tests`: Number of test episodes (default: `10`)
+- `--max_length`: Max steps per test episode (default: `1500`)
+- `--seeds`: Comma-separated list of seeds. The number of seeds must match `--num_tests`.
+- `--output_csv`: CSV file path for results (default: `test_results.csv`)
+- `--hardcore`: Use `BipedalWalkerHardcore-v3` environment if set.
+
+**Example:**
+```bash
+python testing.py --model_dir models --model_name DAC_policy --num_tests 3 --max_length 1000 --seeds 0,10,42 --hardcore --output_csv test_results.csv
+```
+
+Output: A `test_results.csv` file containing the returns and steps taken in each test episode using the specified seeds.
+
+---
 
 ## Suggested Workflow
 
-1. **Train the agent** using `train.py` with your desired `--num_steps`.  
-2. **Collect demonstrations** using `collect_demo.py` from the newly trained model.  
-3. **Record a video** of the trained agent’s behavior using `record_video.py` to visualize performance.
+1. **Train the agent** using `train.py`.
+2. **Collect additional demonstrations** using `collect_demo.py`.
+3. **Record a video** of the trained agent using `record_video.py` for qualitative evaluation.
+4. **Test the agent** with various seeds and optional hardcore environment using `testing.py` and analyze the results in the generated CSV file.
 
-By following the above steps, you can iterate on your training process, gather demonstration data, and visually inspect how the trained agent performs.
+This process allows you to develop, evaluate, and visualize the performance of the DAC agent.
